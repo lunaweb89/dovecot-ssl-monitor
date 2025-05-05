@@ -3,12 +3,12 @@
 # === Install SSL Monitor Script for CyberPanel + Dovecot ===
 # - Creates /usr/local/bin/check-dovecot-ssl.sh
 # - Sets daily cron job
-# - Uses internal mail (sendmail/mailx)
+# - Uses local mail for alerts
 # - No system updates to prevent crash
 
 set -e
 
-EMAIL="lunawebagency@gmail.com"  # <-- Replace with your email
+EMAIL="alerts@yourdomain.com"  # <-- Replace with your email
 
 MONITOR_SCRIPT="/usr/local/bin/check-dovecot-ssl.sh"
 
@@ -23,77 +23,75 @@ else
 fi
 
 echo "[+] Creating SSL monitor script..."
-sudo tee "$MONITOR_SCRIPT" > /dev/null <<EOF
+sudo tee "$MONITOR_SCRIPT" > /dev/null <<'EOF'
 #!/bin/bash
 
 ALERT_THRESHOLD=7
-ALERTS=""
-EMAIL_TO="$EMAIL"
-EMAIL_SUBJECT="[ALERT] Dovecot SSL Expiry Report from \$(hostname)"
-TMP_EMAIL="/tmp/dovecot_ssl_alerts.txt"
+RENEWED_DOMAINS=""
+EMAIL_TO="alerts@yourdomain.com"
+EMAIL_SUBJECT="[INFO] SSL Renewals from $(hostname)"
+TMP_EMAIL="/tmp/dovecot_ssl_renewals.txt"
 
-echo "---- [DOVECOT SSL CHECK] \$(date) ----"
+echo "---- [SSL CERT CHECK] $(date) ----"
 
 for dir in /home/*; do
-  [[ -d "\$dir" ]] || continue
+  [[ -d "$dir" ]] || continue
 
-  domain=\$(basename "\$dir")
-  [[ "\$domain" != *.* ]] && continue
+  domain=$(basename "$dir")
+  [[ "$domain" != *.* ]] && continue
 
-  mail_domain="mail.\$domain"
-  echo "🔍 Checking \$mail_domain:993..."
+  for check_domain in "$domain" "mail.$domain"; do
+    echo "🔍 Checking $check_domain:443..."
 
-  if ! getent hosts "\$mail_domain" > /dev/null || ! timeout 2 bash -c "</dev/tcp/\$mail_domain/993" 2>/dev/null; then
-    echo "⚠️ Skipping \$mail_domain (DNS or port 993 issue)"
+    if ! getent hosts "$check_domain" > /dev/null || ! timeout 2 bash -c "</dev/tcp/$check_domain/443" 2>/dev/null; then
+      echo "⚠️ Skipping $check_domain (DNS or port 443 issue)"
+      echo "---------------------------------------------"
+      continue
+    fi
+
+    cert_info=$(echo | openssl s_client -connect "$check_domain:443" -servername "$check_domain" 2>/dev/null | openssl x509 -noout -subject -issuer -enddate)
+    if [[ -z "$cert_info" ]]; then
+      echo "❌ Unable to retrieve cert from $check_domain"
+      echo "---------------------------------------------"
+      continue
+    fi
+
+    expiry_raw=$(echo "$cert_info" | grep notAfter= | cut -d= -f2-)
+    expiry_date=$(date -d "$expiry_raw" +"%Y-%m-%d")
+    expiry_ts=$(date -d "$expiry_raw" +%s)
+    now_ts=$(date +%s)
+    days_left=$(( (expiry_ts - now_ts) / 86400 ))
+
+    if (( expiry_ts < now_ts || days_left <= ALERT_THRESHOLD )); then
+      echo "🔁 Attempting to renew cert for $domain..."
+      if /usr/bin/cyberpanel issueSSL --domainName "$domain"; then
+        RENEWED_DOMAINS+="✅ Renewed: $check_domain (was expiring on $expiry_date)\n"
+      else
+        RENEWED_DOMAINS+="❌ Renewal failed: $check_domain\n"
+      fi
+    fi
+
+    echo "Domain    : $check_domain"
+    echo "Expires   : $expiry_date"
+    echo "Days Left : $days_left"
     echo "---------------------------------------------"
-    continue
-  fi
-
-  cert_info=\$(echo | openssl s_client -connect "\$mail_domain:993" -servername "\$mail_domain" 2>/dev/null | openssl x509 -noout -subject -issuer -enddate)
-  if [[ -z "\$cert_info" ]]; then
-    echo "❌ Unable to retrieve cert from \$mail_domain"
-    echo "---------------------------------------------"
-    continue
-  fi
-
-  expiry_raw=\$(echo "\$cert_info" | grep notAfter= | cut -d= -f2-)
-  expiry_date=\$(date -d "\$expiry_raw" +"%Y-%m-%d")
-  expiry_ts=\$(date -d "\$expiry_raw" +%s)
-  now_ts=\$(date +%s)
-  days_left=\$(( (expiry_ts - now_ts) / 86400 ))
-
-  if (( expiry_ts < now_ts )); then
-    status="❌ EXPIRED"
-    ALERTS+="❌ EXPIRED: \$mail_domain (expired on \$expiry_date)\n"
-  elif (( days_left <= ALERT_THRESHOLD )); then
-    status="⚠️ Expiring Soon (\$days_left days left)"
-    ALERTS+="⚠️ Expiring Soon: \$mail_domain (expires in \$days_left days on \$expiry_date)\n"
-    echo "🔁 Attempting to renew cert for \$domain..."
-    /usr/bin/cyberpanel issueSSL --domainName \$domain || echo "⚠️ Renewal failed for \$domain"
-  else
-    status="✅ Valid (\$days_left days left)"
-  fi
-
-  echo "Domain    : \$mail_domain"
-  echo "Expires   : \$expiry_date"
-  echo "Status    : \$status"
-  echo "---------------------------------------------"
+  done
 done
 
-if [[ -n "\$ALERTS" ]]; then
+if [[ -n "$RENEWED_DOMAINS" ]]; then
   {
-    echo "Subject: \$EMAIL_SUBJECT"
-    echo "To: \$EMAIL_TO"
-    echo "From: \$EMAIL_TO"
+    echo "Subject: $EMAIL_SUBJECT"
+    echo "To: $EMAIL_TO"
+    echo "From: $EMAIL_TO"
     echo ""
-    echo -e "The following SSL certificates are expired or expiring soon:\n"
-    echo -e "\$ALERTS"
-  } > "\$TMP_EMAIL"
+    echo -e "The following SSL certificates were renewed on $(date):\n"
+    echo -e "$RENEWED_DOMAINS"
+  } > "$TMP_EMAIL"
 
-  /usr/sbin/sendmail -t < "\$TMP_EMAIL" || mail -s "\$EMAIL_SUBJECT" "\$EMAIL_TO" < "\$TMP_EMAIL"
-  echo "🚨 Alert email sent to \$EMAIL_TO"
+  /usr/sbin/sendmail -t < "$TMP_EMAIL" || mail -s "$EMAIL_SUBJECT" "$EMAIL_TO" < "$TMP_EMAIL"
+  echo "📬 Renewal report sent to $EMAIL_TO"
 else
-  echo "✅ No expiring or expired certs."
+  echo "✅ No renewals required today."
 fi
 EOF
 
