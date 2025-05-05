@@ -8,7 +8,7 @@
 
 set -e
 
-EMAIL="alerts@yourdomain.com"  # <-- Replace with your email
+EMAIL="lunawebagency@gmail.com"  # <-- Replace with your email
 
 MONITOR_SCRIPT="/usr/local/bin/check-dovecot-ssl.sh"
 
@@ -26,7 +26,7 @@ echo "[+] Creating SSL monitor script..."
 sudo tee "$MONITOR_SCRIPT" > /dev/null <<EOF
 #!/bin/bash
 
-ALERT_THRESHOLD=15
+ALERT_THRESHOLD=7
 ALERTS=""
 EMAIL_TO="$EMAIL"
 EMAIL_SUBJECT="[ALERT] Dovecot SSL Expiry Report from \$(hostname)"
@@ -68,6 +68,8 @@ for dir in /home/*; do
   elif (( days_left <= ALERT_THRESHOLD )); then
     status="⚠️ Expiring Soon (\$days_left days left)"
     ALERTS+="⚠️ Expiring Soon: \$mail_domain (expires in \$days_left days on \$expiry_date)\n"
+    echo "🔁 Attempting to renew cert for \$domain..."
+    /usr/bin/cyberpanel issueSSL --domainName \$domain || echo "⚠️ Renewal failed for \$domain"
   else
     status="✅ Valid (\$days_left days left)"
   fi
